@@ -110,17 +110,21 @@ class Webdav {
     client.setConnectTimeout(15000);
     try {
       var files = await client.readDir(configs[3]);
-      // 备份文件名是 "<unix秒>.picadata"。清理策略：
-      // 只保留将要写入的新版本，其余旧备份全部删除（保留 1 个）。
+      // 备份文件名是 "<unix秒>.picadata"。清理策略：服务器上**只保留 1 份**备份。
       //
       // 旧实现用 `int.parse(version) ~/ 86400 == now ~/ 86400` 判断"同一天"，
       // 看似合理，实则有个致命 bug：86400 秒切分的是 **UTC 日**，而中国是
       // UTC+8，本地时间每天 08:00 才跨 UTC 日界。于是"今天 07:33 上传的备份"
       // 和"今天 13:07 上传的备份"落在不同的 UTC 日，比较失败 → 旧文件不删，
-      // 服务器上就攒下一堆 .picadata。多个备份存在时，下载端会取时间戳
-      // 最大的那个，虽然能选对，但目录越来越乱，也容易让用户误判。
+      // 服务器上就攒下一堆 .picadata。
+      //
+      // 另一个坑：下载合并后会把结果"回推"服务器（见 downloadData 末尾），
+      // 回推会生成一个新时间戳文件，此时服务器上恰好有 **1 个**旧文件。
+      // 早期版本写的是 `stale.length > 1 ? stale.sublist(0, stale.length - 1) : []`
+      // —— stale 只有 1 个时直接不删，于是"回推"永远留下一对文件。
+      // 正确做法：本次要写的版本之外，**其余全部删掉**。
       var newVersion = appdata.settings[46];
-      // 收集所有"不是本次要写入版本"的旧备份。
+      // 收集所有"不是本次要写入版本"的旧备份，稍后新文件写成功再统一清理。
       var stale = <String>[];
       for (var file in files) {
         var name = file.name;
@@ -130,17 +134,14 @@ class Webdav {
         if (version == newVersion) continue;
         stale.add(file.path!);
       }
-      // 只保留最新的一份：把 stale 从旧到新排序后，删掉除最后一个之外的
-      // 全部，最后再删掉"倒数第二个"，最终只留下一个最新的备份。
-      // 这样即使某次上传中途失败，也不会出现"删了新文件却留着旧文件"。
-      stale.sort((a, b) {
-        var av = int.tryParse(a.split('/').last.split('.').first) ?? 0;
-        var bv = int.tryParse(b.split('/').last.split('.').first) ?? 0;
-        return av.compareTo(bv);
-      });
-      // 留最新的一个不删，其余全删。
-      var toRemove = stale.length > 1 ? stale.sublist(0, stale.length - 1) : <String>[];
-      for (var path in toRemove) {
+      // 先写入新版本，成功之后再清理旧文件。
+      // 顺序很重要：若先删旧再写新，一旦写入失败（网络中断/配额满）就会
+      // 连旧备份也丢掉，服务器上什么都不剩。先写后删则最坏情况只是留下
+      // 一对文件（下次上传会再清一次），不会造成数据丢失。
+      await client.writeFromFile(await exportDataToFile(false, "${App.cachePath}/userdata.picadata"),
+          "${configs[3]}${appdata.settings[46]}.picadata");
+      // 新备份落盘成功，现在可以安全删掉所有旧版本，服务器上只留 1 份。
+      for (var path in stale) {
         try {
           await client.remove(path);
           LogManager.addLog(LogLevel.info, "Sync", "Removed stale backup: $path");
@@ -150,8 +151,6 @@ class Webdav {
               "Failed to remove stale backup $path\n$e");
         }
       }
-      await client.writeFromFile(await exportDataToFile(false, "${App.cachePath}/userdata.picadata"),
-          "${configs[3]}${appdata.settings[46]}.picadata");
     } catch (e, s) {
       lastSyncErrorWasRateLimit = _isTooManyRequests(e);
       lastError = _describeError(e, stage: "上传");

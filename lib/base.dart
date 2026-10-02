@@ -724,34 +724,43 @@ class Appdata {
         "favoriteTags": favoriteTags.toList(),
       };
 
+  /// 那些「属于本机身份、绝不能被其它设备覆盖」的设置项索引。
+  ///
+  /// 这类设置描述的是**当前这台设备自己**的状态，同步到别的设备上会出乱子：
+  /// - 13 需要生物识别（本机是否录入过指纹/面容，各机不同）
+  /// - 22 下载目录（各平台的绝对路径，各机不同）
+  /// - 45 WebDAV 配置（url;用户名;密码;路径 —— 覆盖了会把 A 机的密码写到 B 机）
+  /// - 46 本机数据版本号（覆盖了会让同步被静默跳过）
+  ///
+  /// 注意：**开关型设置（如 103 液态玻璃底栏）不在白名单内**，它们应当从备份
+  /// 同步过来，否则「A 机开了悬浮底栏、B 机同步后没生效」。
+  static const _deviceLocalSettingIndexes = <int>{13, 22, 45, 46};
+
   /// 从备份 json 恢复数据。
   ///
-  /// [mergeSettings] 为 true 时使用「合并式导入」：本机已有非空值的设置项
-  /// 保留本机值，只有本机为空的项才用备份填充 —— 这样手动「导入用户数据」
-  /// 不会再抹掉本机原有配置。
+  /// [mergeSettings] 为 true 时使用「合并式导入」：只保留 [_deviceLocalSettingIndexes]
+  /// 里列出的「本机身份」设置，其余设置一律采用备份值 —— 这样在已引导的设备上
+  /// 也能正确同步「悬浮底栏」等开关型设置。
   /// 为 false 时保留旧行为（逐位覆盖），用于新设备首次从 WebDAV 恢复配置。
   bool readDataFromJson(Map<String, dynamic> json,
       {bool mergeSettings = false}) {
     try {
       var newSettings = List<String>.from(json["settings"]);
-      var downloadPath = settings[22];
-      var authRequired = settings[13];
-      // 同步配置(45)与本机数据版本(46)属于「本机身份」，绝不能被备份覆盖，
-      // 否则会把 A 机的 WebDAV 地址/密码写到 B 机上，并让版本号错乱
-      // （历史上正是 settings[46] 被覆盖导致同步被静默跳过）。
-      var localWebdavConfig = settings[45];
-      var localDataVersion = settings[46];
+      // 先记下本机身份类设置的现值，稍后原样写回。
+      var preserved = <int, String>{};
+      if (mergeSettings) {
+        for (var i in _deviceLocalSettingIndexes) {
+          if (i < settings.length) preserved[i] = settings[i];
+        }
+      }
       for (var i = 0; i < settings.length && i < newSettings.length; i++) {
-        if (mergeSettings && settings[i].isNotEmpty) {
-          // 合并式导入：本机已有值 -> 保留
+        if (mergeSettings && preserved.containsKey(i)) {
+          // 合并式导入：本机身份类设置 -> 保留本机值。
           continue;
         }
+        // 其余设置（含 103 液态玻璃底栏等开关）一律采用备份值。
         settings[i] = newSettings[i];
       }
-      settings[22] = downloadPath;
-      settings[13] = authRequired;
-      settings[45] = localWebdavConfig;
-      settings[46] = localDataVersion;
       var newFirstUse = List<String>.from(json["firstUse"]);
       for (var i = 0; i < firstUse.length && i < newFirstUse.length; i++) {
         firstUse[i] = newFirstUse[i];

@@ -24,45 +24,9 @@ if (flutterVersionName == null) {
 }
 
 
-// ---------------------------------------------------------------------------
-// 固定签名（内联 keystore）
-//
-// 目的：让每一次 CI 编译都使用同一个 keystore，从而多台设备可以互相覆盖安装，
-// 不会出现 INSTALL_FAILED_UPDATE_INCOMPATIBLE（签名不一致）。
-//
-// 工作方式：
-//   1. 如果 android/key.properties 已存在（本地开发），直接使用它；
-//   2. 否则把下面内联的 base64 keystore 解码写入 android/picacomic-release.jks，
-//      并生成临时 key.properties —— CI 无需任何 Secret 即可完成签名。
-// ---------------------------------------------------------------------------
-def inlineKeystoreB64 = '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==='
-
 def keystorePropertiesFile = rootProject.file("key.properties")
 def keystoreProperties = new Properties()
-def hasKeystore = keystorePropertiesFile.exists()
-if (hasKeystore) {
-    keystorePropertiesFile.withReader('UTF-8') { reader ->
-        keystoreProperties.load(reader)
-    }
-} else {
-    // CI / 无本地密钥环境：把内联 keystore 落盘后再加载配置
-    try {
-        // 写到 app 模块目录，并用绝对路径，避免相对路径解析歧义
-        def inlineJks = new File(project.projectDir, "picacomic-release.jks")
-        if (!inlineJks.exists()) {
-            inlineJks.bytes = inlineKeystoreB64.decodeBase64()
-        }
-        keystoreProperties.setProperty('storePassword', 'Picacomic2026')
-        keystoreProperties.setProperty('keyPassword', 'Picacomic2026')
-        keystoreProperties.setProperty('keyAlias', 'picacomic')
-        keystoreProperties.setProperty('storeFile', inlineJks.absolutePath)
-        hasKeystore = true
-        println "[signing] 使用内联固定 keystore 签名: ${inlineJks.absolutePath}"
-    } catch (Exception e) {
-        println "[signing] 内联 keystore 不可用，回退 debug 签名: ${e.message}"
-        hasKeystore = false
-    }
-}
+keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
 
 android {
     compileSdk flutter.compileSdkVersion
@@ -71,7 +35,7 @@ android {
     splits{
         abi {
             reset()
-            include 'arm64-v8a', 'armeabi-v7a', 'x86_64'
+            include 'arm64-v8a', 'x86_64'
             enable true
             universalApk true
         }
@@ -103,27 +67,24 @@ android {
     }
 
     signingConfigs {
-        if (hasKeystore) {
-            debug {
-                storeFile file(keystoreProperties['storeFile'])
-                storePassword keystoreProperties['storePassword']
-                keyAlias keystoreProperties['keyAlias']
-                keyPassword keystoreProperties['keyPassword']
-            }
-            release {
-                keyAlias keystoreProperties['keyAlias']
-                keyPassword keystoreProperties['keyPassword']
-                storeFile file(keystoreProperties['storeFile'])
-                storePassword keystoreProperties['storePassword']
-            }
+        debug {
+            storeFile file(keystoreProperties['storeFile'])
+            storePassword keystoreProperties['storePassword']
+            keyAlias keystoreProperties['keyAlias']
+            keyPassword keystoreProperties['keyPassword']
+        }
+        release {
+            keyAlias keystoreProperties['keyAlias']
+            keyPassword keystoreProperties['keyPassword']
+            storeFile file(keystoreProperties['storeFile'])
+            storePassword keystoreProperties['storePassword']
         }
     }
 
     buildTypes {
         release {
-            // 有 key.properties 时用正式签名；CI/无密钥环境下回退到 debug 签名，
-            // 保证仍能产出可安装的 release APK。
-            signingConfig hasKeystore ? signingConfigs.release : signingConfigs.debug
+            // Signing with the debug keys for now, so `flutter run --release` works.
+            signingConfig signingConfigs.release
             applicationVariants.all { variant ->
                 variant.outputs.all { output ->
                     def abi = output.getFilter(com.android.build.OutputFile.ABI)
@@ -137,11 +98,6 @@ android {
         }
     }
     namespace 'com.github.pacalini.pica_comic'
-
-    buildFeatures {
-        // HistoryWidget.kt 使用 Compose 编写 Glance 小组件
-        compose true
-    }
 }
 
 flutter {
@@ -151,18 +107,4 @@ flutter {
 dependencies {
     coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'
     implementation 'com.google.android.gms:play-services-base:18.3.0'
-    // HistoryWidget.kt 使用 Glance 实现桌面小组件（androidx.glance.*）。
-    // 原项目从未配置过 Android 构建，这些依赖一直缺失，导致 AAPT 找不到
-    // glance_default_loading_layout 等资源。
-    implementation 'androidx.glance:glance-appwidget:1.2.0'
-    implementation 'androidx.glance:glance-material3:1.2.0'
-    // Glance 依赖 Compose runtime / ui（HistoryWidget.kt 直接 import androidx.compose.*）
-    implementation platform('androidx.compose:compose-bom:2025.09.00')
-    implementation 'androidx.compose.runtime:runtime'
-    implementation 'androidx.compose.ui:ui'
-    implementation 'androidx.compose.ui:ui-graphics'
-    // MainActivity.kt 使用 androidx.core.content.ContextCompat（动态权限检查）
-    implementation 'androidx.core:core-ktx:1.15.0'
-    // MainActivity.kt / HistoryWidget.kt 使用 kotlinx.coroutines
-    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0'
 }

@@ -264,12 +264,33 @@ class Webdav {
     return "$stage失败：$s";
   }
 
-  static Future<bool> downloadData([String? config,
-      bool force = false]) async {
+  /// 从服务器下载备份并合并进本机。
+  ///
+  /// [force] 为 true 时跳过「服务器版本号与本机相同就跳过」的判断，
+  /// 一定要执行一次导入。手动点「下载」必须传 true。
+  ///
+  /// [pullSettings] 决定**这次下载要不要把服务器上的设置也拉过来覆盖本机**：
+  ///
+  /// - `true` —— 手动「下载数据」按钮。语义就是「以服务器为准」，
+  ///   用户在设置页先把某项改成不一样的，再点下载，期望它变回备份里的值。
+  /// - `false`（默认）—— **自动同步**（启动时、切回前台每 2 小时一次）。
+  ///   这类同步只应该合并收藏/历史等**数据**，绝不能碰 `settings`。
+  ///
+  /// 为什么自动同步必须传 false：自动同步是无感的、用户根本没点过任何按钮。
+  /// 若它顺手把服务器设置覆盖到本机，就会出现「我在这台机器上改好了翻页模式 /
+  /// 底栏，什么都没点，只是重开了一下 App，设置就被打回服务器上的旧值」。
+  /// 这正是多设备场景下最容易踩的坑 —— 用户在 A 机改了设置但没上传，
+  /// B 机一启动就把 A 机的改动冲掉了。
+  static Future<bool> downloadData([String? config, bool force = false,
+      bool pullSettings = false]) async {
     _isOperating = true;
     // 传了 config 一定意味着是手动（设置页的测试/下载按钮带的配置字符串），
     // 此时无条件强制覆盖；否则由调用方通过 force 显式声明。
     force = force || config != null;
+    // 显式传了 config（设置页按钮）同样视为「以服务器为准」。
+    if (config != null) {
+      pullSettings = true;
+    }
     lastError = null;
     try {
       config ??= appdata.settings[45];
@@ -315,7 +336,11 @@ class Webdav {
             "${configs[3]}$fileName", "$cachePath/picadata");
         // Force import: a manual download must never be silently skipped by the
         // internal settings[46] version comparison.
-        var res = await importData("$cachePath/picadata", true);
+        //
+        // mergeSettings 由 pullSettings 决定：
+        //   手动下载 → true，把服务器设置一并拉过来（"以服务器为准"）
+        //   自动同步 → false，只合并收藏/历史，本机设置原样保留
+        var res = await importData("$cachePath/picadata", true, pullSettings);
         if (!res) {
           lastError = lastImportError ?? "导入备份数据失败";
           return false;

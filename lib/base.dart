@@ -633,7 +633,15 @@ class Appdata {
     var s = await SharedPreferences.getInstance();
   }
 
-  Future<void> writeData([bool sync = true]) async {
+  /// 写入全部数据（settings / 隐式数据等）。
+  ///
+  /// [sync] 默认 **false** —— 只写本机，**不触发上传**。
+  ///
+  /// 与 [updateSettings] 同理：全项目有 30+ 处调用 `writeData()`，散布在
+  /// 阅读设置、收藏、更新提醒等各个角落，其中多数只是「顺手存一下」。
+  /// 旧默认值 true 会让这些零散的写入点**每次都把整份数据推上服务器**，
+  /// 在多设备下表现为「什么都没点，另一台就变了」。需要立即同步的场景请显式传 `true`。
+  Future<void> writeData([bool sync = false]) async {
     writeImplicitData();
     if (sync) {
       Webdav.uploadData();

@@ -216,9 +216,12 @@ class Webdav {
     return "$stage失败：$s";
   }
 
-  static Future<bool> downloadData([String? config]) async {
+  static Future<bool> downloadData([String? config,
+      bool force = false]) async {
     _isOperating = true;
-    bool force = config != null;
+    // 传了 config 一定意味着是手动（设置页的测试/下载按钮带的配置字符串），
+    // 此时无条件强制覆盖；否则由调用方通过 force 显式声明。
+    force = force || config != null;
     lastError = null;
     try {
       config ??= appdata.settings[45];
@@ -310,7 +313,9 @@ class Webdav {
       message: "同步数据中".tl,
       cancelButtonText: "隐藏".tl,
     );
-    var res = await _retryZone(Webdav.downloadData);
+    // 自动同步（启动时/定时）走非强制路径：服务器版本与本机一致就跳过，
+    // 避免每次启动都重新导入一遍。用户手动点"下载"不走这里。
+    var res = await _retryZone(() => Webdav.downloadData(null, false));
     await Future.delayed(const Duration(milliseconds: 50));
     controller.close();
     if (!res) {

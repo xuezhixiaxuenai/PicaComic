@@ -52,7 +52,11 @@ class DataSync extends StateController {
     }
   }
 
-  Future<void> downloadData() async {
+  /// 下载/导入备份数据。
+  ///
+  /// [force] 为 true 时表示这是**用户主动点按**的下载，必须无条件覆盖本机
+  /// 数据；否则（后台自动同步）在服务器版本号与本机相同时会直接跳过。
+  Future<void> downloadData({bool force = true}) async {
     if (_isUploading || _isDownloading) return;
 
     _isDownloading = true;
@@ -60,7 +64,7 @@ class DataSync extends StateController {
     update();
 
     try {
-      var result = await Webdav.downloadData();
+      var result = await Webdav.downloadData(null, force);
       if (!result) {
         _lastError = 'Download failed';
       }

@@ -601,7 +601,20 @@ class Appdata {
     }
   }
 
-  Future<void> updateSettings([bool syncData = true]) async {
+  /// 把 `settings` 写入本机文件。
+  ///
+  /// [syncData] 默认 **false** —— 只写本机，**不触发上传**。
+  ///
+  /// 为什么改掉原来的默认值：全项目有 30+ 处调用 `updateSettings()`（用户每拨
+  /// 动一个设置开关都会调到），旧默认值是 true，于是「改任一设置 = 立刻把整份
+  /// 数据上传覆盖服务器」。由此带来两个真实困扰：
+  /// 1. 两台机器各改一个设置 → 后改的那台把前一台的设置覆盖掉；
+  /// 2. 启动时 main.dart 的「Fluent UI 与液态玻璃互斥」自检也会顺带上传，
+  ///    把本机被清零的开关推给服务器，导致另一台设置莫名其妙变回去。
+  ///
+  /// 现在改为：设置只写本机，要同步由用户手动点「上传」。
+  /// 需要「改完就同步」的场景请显式传 `true`。
+  Future<void> updateSettings([bool syncData = false]) async {
     var settingsFile = File("${App.dataPath}/settings");
 
     await settingsFile.writeAsString(jsonEncode(settings));
@@ -742,8 +755,12 @@ class Appdata {
   /// 里列出的「本机身份」设置，其余设置一律采用备份值 —— 这样在已引导的设备上
   /// 也能正确同步「悬浮底栏」等开关型设置。
   /// 为 false 时保留旧行为（逐位覆盖），用于新设备首次从 WebDAV 恢复配置。
+  ///
+  /// [skipSettings] 为 true 时**完全不动** `settings`，只合并收藏/历史等数据。
+  /// 用于「上传前的预合并」：那一刻本机设置才是权威值（用户刚改的），
+  /// 拉服务器备份只是为了合并收藏，绝不能让它把设置盖回去。
   bool readDataFromJson(Map<String, dynamic> json,
-      {bool mergeSettings = false}) {
+      {bool mergeSettings = false, bool skipSettings = false}) {
     try {
       var newSettings = List<String>.from(json["settings"]);
       // 先记下本机身份类设置的现值，稍后原样写回。
@@ -754,6 +771,10 @@ class Appdata {
         }
       }
       for (var i = 0; i < settings.length && i < newSettings.length; i++) {
+        if (skipSettings) {
+          // 预合并模式：设置完全保留本机值，一个字节都不改。
+          break;
+        }
         if (mergeSettings && preserved.containsKey(i)) {
           // 合并式导入：本机身份类设置 -> 保留本机值。
           continue;

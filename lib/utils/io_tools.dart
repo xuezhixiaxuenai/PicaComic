@@ -518,7 +518,15 @@ bool get lastImportMergedSomething => _lastMergeChanges > 0;
 ///               Manual "download data" from WebDAV must pass true, otherwise a
 ///               device whose settings[46] already matches the server will
 ///               silently refuse to import (the sync "deadlock" bug).
-Future<bool> importData([String? filePath, bool force = false]) async {
+///
+/// [mergeSettings] - 是否允许用备份里的值覆盖本机 `settings`。
+///   默认 true（正常的「下载」语义：把服务器设置同步过来）。
+///   但**上传前的预合并必须传 false** —— 那时本机设置才是用户刚改好的、
+///   要上传的那一份；若被服务器上的旧设置覆盖回去，用户就会遇到
+///   「刚改的底栏/翻页模式一上传就变回去了」。
+///   预合并只应该合并「数据」（收藏、历史、评论），不该碰设置。
+Future<bool> importData([String? filePath, bool force = false,
+    bool mergeSettings = true]) async {
   final enableCheck = filePath != null && !force;
   var path = (await getApplicationSupportDirectory()).path;
   if (filePath == null) {
@@ -775,9 +783,13 @@ Future<bool> importData([String? filePath, bool force = false]) async {
   // 已完成引导的设备则采用合并式导入，保留本机原有配置。
   var isFreshDevice = !(appdata.firstUse.length > 3 &&
       appdata.firstUse[3] == "1");
+  // 调用方显式不允许合并设置时（上传前的预合并），直接跳过设置导入 ——
+  // 本机设置是用户刚改好的，不能被服务器上的旧值盖回去。
+  var effectiveMergeSettings = mergeSettings && !isFreshDevice;
   var dataReadRes = await appdata.readDataFromJson(
     json,
-    mergeSettings: !isFreshDevice,
+    mergeSettings: effectiveMergeSettings,
+    skipSettings: !mergeSettings,
   );
   if (!dataReadRes) {
     LogManager.addLog(

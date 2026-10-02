@@ -67,23 +67,20 @@ bool lastSyncErrorWasRateLimit = false;
 class Webdav {
   static bool _isOperating = false;
 
-  static bool _haveWaitingTask = false;
-
   /// Human-readable reason for the most recent sync failure, shown to the user.
   static String? lastError;
 
   /// Sync current data to webdav server. Return true if success.
   static Future<bool> uploadData([String? config]) async {
-    if (_haveWaitingTask) {
+    // 已经有一次上传在跑：直接跳过，不排队等待。
+    //
+    // 旧实现在这种情况会 `while (_isOperating) await ...` 自等 —— 因为
+    // _uploadInternal 内部的「上传前预合并」会走 importData → 恢复收藏/
+    // 历史 → 触发 saveData() → 回到这里，形成死锁。
+    // 同步本身是「最后一次为准」的幂等操作，重入直接返回即可。
+    if (_isOperating) {
       return true;
     }
-    if (_isOperating) {
-      _haveWaitingTask = true;
-      while (_isOperating) {
-        await Future.delayed(const Duration(milliseconds: 100));
-      }
-    }
-    _haveWaitingTask = false;
     _isOperating = true;
     try {
       return await _uploadInternal(config);
@@ -93,11 +90,13 @@ class Webdav {
   }
 
   /// 执行上传（不处理并发锁），供 [uploadData] 和下载后的自动回传复用。
-  static Future<bool> _uploadInternal(String? config) async {
+  ///
+  /// [mergeBeforeUpload] 为 true 时，会先把服务器上的现有备份拉下来与本机
+  /// 做并集合并，再写回服务器。这样「A 机上传 → B 机上传」不会把 A 的数据
+  /// 整盘覆盖掉，用户也不需要再讲究「谁先上传谁后下载」的顺序。
+  static Future<bool> _uploadInternal(String? config,
+      {bool mergeBeforeUpload = true}) async {
     lastError = null;
-    appdata.settings[46] =
-        (DateTime.now().millisecondsSinceEpoch ~/ 1000).toString();
-    appdata.updateSettings(false);
     config ??= appdata.settings[45];
     var configs = _parseConfig(config);
     if (configs == null) {
@@ -109,6 +108,55 @@ class Webdav {
     client.setHeaders({'content-type': 'text/plain'});
     client.setConnectTimeout(15000);
     try {
+      // ── 第一步：先把服务器上的备份拉下来，与本机做并集合并 ──
+      //
+      // 为什么必须这么做：原来的上传是「把本机全量写上去」，服务器上原有的
+      // 内容直接被覆盖。于是 A 机上传完、B 机再上传，A 的东西就没了 ——
+      // 用户实测到的「两个都先上传的话，后面的会覆盖新的」正是这个原因。
+      //
+      // 只有「下载」那条路径会做合并（SyncMerge），上传不做，所以用户被迫
+      // 遵守「先上传、再下载」的顺序。这里让上传也先合并一次，两边就对称了。
+      if (mergeBeforeUpload) {
+        try {
+          var existing = await client.readDir(configs[3]);
+          int? maxVersion;
+          for (var file in existing) {
+            var name = file.name;
+            if (name == null) continue;
+            var version = name.split(".").first;
+            if (version.isNum) {
+              maxVersion = max(maxVersion ?? 0, int.parse(version));
+            }
+          }
+          if (maxVersion != null) {
+            var cachePath = (await getApplicationCacheDirectory()).path;
+            await client.read2File(
+                "${configs[3]}$maxVersion.picadata", "$cachePath/picadata");
+            // force=true  → 跳过版本号检查，一定执行合并
+            // mergeSettings=false → **只合并收藏/历史等数据，完全不碰 settings**
+            //
+            // 后者是关键：此刻本机 settings 才是权威值（用户可能刚改完底栏、
+            // 翻页方式，正要点上传）。若允许备份里的设置覆盖本机，用户会遇到
+            // 「一上传，刚改的设置就变回服务器的旧值」——正是之前的核心困扰。
+            var merged =
+                await importData("$cachePath/picadata", true, false);
+            if (!merged) {
+              LogManager.addLog(LogLevel.error, "Sync",
+                  "Pre-upload merge failed, fallback to plain upload.");
+            }
+          }
+        } catch (e) {
+          // 服务器上没有备份、或拉取失败 —— 都不是致命错误，继续按普通上传走。
+          LogManager.addLog(LogLevel.info, "Sync",
+              "Pre-upload merge skipped: $e");
+        }
+      }
+      // 预合并完成后才刷新版本号，作为本次备份的文件名。
+      // 顺序不能提前：上面的 importData 会写 settings[46]，
+      // 若先取时间戳就会被它覆盖掉。
+      appdata.settings[46] =
+          (DateTime.now().millisecondsSinceEpoch ~/ 1000).toString();
+      appdata.updateSettings(false);
       var files = await client.readDir(configs[3]);
       // 备份文件名是 "<unix秒>.picadata"。清理策略：服务器上**只保留 1 份**备份。
       //
@@ -281,7 +329,10 @@ class Webdav {
           try {
             // 注意：downloadData 当前已持有 _isOperating，必须用内部方法，
             // 否则 uploadData 会在锁上等待自己而死锁。
-            await _uploadInternal(config);
+            //
+            // mergeBeforeUpload: false —— 本次刚刚才把服务器备份合并进本机，
+            // 本机此刻就是超集，再拉一次没有意义，只会白白多一轮请求。
+            await _uploadInternal(config, mergeBeforeUpload: false);
           } catch (e, s) {
             // 回传失败不影响本次下载结果，仅记录日志。
             LogManager.addLog(LogLevel.error, "Sync",

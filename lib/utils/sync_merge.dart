@@ -83,7 +83,16 @@ class SyncMerge {
 
       // 1. 应用墓碑：本机还留着的、已经被删掉的条目 -> 清掉。
       //    （比如 A 机删了并上传，B 机下载时就要把自己这份也删掉。）
-      changed += _applyTombstones(localDb, tombstones);
+      final applied = _applyTombstones(localDb, tombstones);
+      changed += applied;
+      // 墓碑是"隐形"的（不进 UI），出问题时从日志判断它有没有生效。
+      if (tombstones.isNotEmpty || applied > 0) {
+        LogManager.addLog(
+            LogLevel.info,
+            "SyncMerge",
+            "tombstones: total=${tombstones.length}, deleted=$applied, "
+                "backupHasTable=${backupTables.contains(_tombstoneTable)}");
+      }
 
       // 2. 文件夹并集：备份里有、本机没有的文件夹 -> 建表
       for (final table in backupTables) {

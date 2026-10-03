@@ -1062,6 +1062,11 @@ class LocalFavoritesManager {
         insert or replace into deleted_items (folder, target, type, deleted_time)
         values (?, ?, ?, ?);
       """, [folder, target, type, getCurTime()]);
+      // 墓碑在 UI 上看不见，留条日志方便排查"删了又回来"。
+      // 只记类型，**不记 target / 文件夹名** —— 那是用户的收藏内容与分类，
+      // 没必要落到日志里。
+      LogManager.addLog(LogLevel.info, "LocalFavorites",
+          "tombstone written (type=$type)");
     } catch (e) {
       LogManager.addLog(
           LogLevel.error, "LocalFavorites", "write tombstone failed: $e");

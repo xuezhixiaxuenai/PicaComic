@@ -400,8 +400,31 @@ class LocalFavoritesManager {
       );
     """);
     }
+    // 「删除墓碑」表：记录用户删掉的收藏条目。
+    //
+    // 为什么需要它：多设备同步用的是**并集合并**（SyncMerge.mergeFavoriteDb），
+    // 只增不减 —— 本机删掉一条，服务器/另一台设备上还留着，下次合并就把它
+    // 原样搬回来。表现就是「删了又回来，根本删不掉」。
+    //
+    // 有了这张表，删除就变成了一条**可以同步的记录**：合并时先看墓碑，
+    // 被标记删掉的条目不再从备份里补回来，本机已有的也会被清掉。
+    //
+    // 时间戳用于区分「删掉」和「删掉之后又重新收藏」：只有墓碑比条目的
+    // time 新，删除才算数；否则说明用户后来又把这本加回来了。
+    if (!tables.contains('deleted_items')) {
+      _db.execute("""
+      create table deleted_items (
+        folder text,
+        target text,
+        type int,
+        deleted_time TEXT,
+        primary key (folder, target, type)
+      );
+    """);
+    }
     tables.remove('folder_sync');
     tables.remove('folder_order');
+    tables.remove('deleted_items');
     if (tables.isEmpty) return;
     var testTable = tables.first;
     // 检查type是否是主键
@@ -615,10 +638,25 @@ class LocalFavoritesManager {
     return tables;
   }
 
+  /// 不是收藏夹的内部表：同步元数据 + 删除墓碑。
+  ///
+  /// 枚举「有哪些收藏夹」时必须排除它们，否则 `deleted_items` 会在 UI 上
+  /// 显示成一个名叫 "deleted_items" 的收藏夹，点进去还会因为列名对不上而报错。
+  static const Set<String> _internalTables = {
+    'folder_sync',
+    'folder_order',
+    'deleted_items',
+  };
+
+  /// 只返回**收藏夹**表（已剔除内部表）。做「这个收藏夹存在吗」判断时用它。
+  List<String> _getFolderTables() {
+    return _getTablesWithDB()
+        .where((table) => !_internalTables.contains(table))
+        .toList();
+  }
+
   List<String> _getFolderNamesWithDB() {
-    final folders = _getTablesWithDB();
-    folders.remove('folder_sync');
-    folders.remove('folder_order');
+    final folders = _getFolderTables();
     var folderToOrder = <String, int>{};
     for (var folder in folders) {
       var res = _db.select("""
@@ -673,7 +711,7 @@ class LocalFavoritesManager {
 
   int count(String folderName) {
     // 检查表是否存在
-    final tables = _getTablesWithDB();
+    final tables = _getFolderTables();
     if (!tables.contains(folderName)) {
       return 0;
     }
@@ -693,7 +731,7 @@ class LocalFavoritesManager {
   /// 获取所有文件夹中的漫画总数
   int get totalComics {
     final uniqueComics = <String>{};
-    final tables = _getTablesWithDB();
+    final tables = _getFolderTables();
     for (var folder in folderNames) {
       if (!tables.contains(folder)) {
         continue;
@@ -718,7 +756,7 @@ class LocalFavoritesManager {
 
   int maxValue(String folder) {
     // 检查表是否存在
-    final tables = _getTablesWithDB();
+    final tables = _getFolderTables();
     if (!tables.contains(folder)) {
       return 0;
     }
@@ -731,7 +769,7 @@ class LocalFavoritesManager {
 
   int minValue(String folder) {
     // 检查表是否存在
-    final tables = _getTablesWithDB();
+    final tables = _getFolderTables();
     if (!tables.contains(folder)) {
       return 0;
     }
@@ -744,7 +782,7 @@ class LocalFavoritesManager {
 
   List<FavoriteItem> getAllComics(String folder) {
     // 检查表是否存在
-    final tables = _getTablesWithDB();
+    final tables = _getFolderTables();
     if (!tables.contains(folder)) {
       return [];
     }
@@ -758,7 +796,7 @@ class LocalFavoritesManager {
 
   void addTagTo(String folder, String target, String tag) {
     // 检查表是否存在
-    final tables = _getTablesWithDB();
+    final tables = _getFolderTables();
     if (!tables.contains(folder)) {
       return;
     }
@@ -774,7 +812,7 @@ class LocalFavoritesManager {
   List<FavoriteItemWithFolderInfo> allComics() {
     var res = <FavoriteItemWithFolderInfo>[];
     final uniqueComics = <String>{};
-    final tables = _getTablesWithDB();
+    final tables = _getFolderTables();
 
     for (final folder in folderNames) {
       // 检查表是否存在
@@ -845,7 +883,7 @@ class LocalFavoritesManager {
 
   bool comicExists(String folder, String target, int type) {
     // 检查表是否存在
-    final tables = _getTablesWithDB();
+    final tables = _getFolderTables();
     if (!tables.contains(folder)) {
       return false;
     }
@@ -859,7 +897,7 @@ class LocalFavoritesManager {
 
   FavoriteItem getComic(String folder, String target, FavoriteType type) {
     // 检查表是否存在
-    final tables = _getTablesWithDB();
+    final tables = _getFolderTables();
     if (!tables.contains(folder)) {
       throw Exception("Table '$folder' does not exist");
     }
@@ -884,7 +922,7 @@ class LocalFavoritesManager {
     }
 
     // 检查表是否存在
-    final tables = _getTablesWithDB();
+    final tables = _getFolderTables();
     if (!tables.contains(folder)) {
       throw Exception("Table '$folder' does not exist");
     }
@@ -915,6 +953,11 @@ class LocalFavoritesManager {
           '${comic.tags.join(',').toParam}', '${comic.coverPath.toParam}', '${comic.time.toParam}', ${minValue(folder) - 1});
       """);
     }
+    // 重新收藏 -> 撤销该条目的「删除墓碑」。
+    //
+    // 否则之前删过、现在又加回来的这条，会在下次同步时被墓碑再删一次
+    // （合并逻辑只看墓碑时间与条目时间谁更新，这里把墓碑清掉最干净）。
+    _clearTombstone(folder, comic.target, comic.type.key);
     updateUI();
     saveData();
     try {
@@ -994,7 +1037,7 @@ class LocalFavoritesManager {
     _modifiedAfterLastCache = true;
 
     // 检查表是否存在
-    final tables = _getTablesWithDB();
+    final tables = _getFolderTables();
     if (!tables.contains(folder)) {
       return; // 如果表不存在，直接返回
     }
@@ -1003,7 +1046,38 @@ class LocalFavoritesManager {
       delete from "$folder"
       where target == ? and type == ?;
     """, [target, type.key]);
+    // 记下「这条被删了」。
+    //
+    // 同步是并集合并（只增不减），不留墓碑的话，服务器或另一台设备上还留着
+    // 这条，下次合并就原样搬回来 —— 表现为「删了又回来，怎么都删不掉」。
+    // 有了墓碑，删除本身也成了一条可以同步的记录。
+    _writeTombstone(folder, target, type.key);
     saveData();
+  }
+
+  /// 记录一条删除墓碑（folder + target + type 唯一）。
+  void _writeTombstone(String folder, String target, int type) {
+    try {
+      _db.execute("""
+        insert or replace into deleted_items (folder, target, type, deleted_time)
+        values (?, ?, ?, ?);
+      """, [folder, target, type, getCurTime()]);
+    } catch (e) {
+      LogManager.addLog(
+          LogLevel.error, "LocalFavorites", "write tombstone failed: $e");
+    }
+  }
+
+  /// 撤销删除墓碑（条目被重新收藏时调用）。
+  void _clearTombstone(String folder, String target, int type) {
+    try {
+      _db.execute("""
+        delete from deleted_items
+        where folder == ? and target == ? and type == ?;
+      """, [folder, target, type]);
+    } catch (e) {
+      // 旧库可能还没建这张表，忽略即可。
+    }
   }
 
   Future<void> clearAll() async {
@@ -1060,7 +1134,7 @@ class LocalFavoritesManager {
       for (final t in targets) {
         final type = _pendingTypes[t]!;
         for (final folder in folderNames) {
-          final tables = _getTablesWithDB();
+          final tables = _getFolderTables();
           if (!tables.contains(folder)) {
             continue;
           }
@@ -1109,7 +1183,7 @@ class LocalFavoritesManager {
 
   String folderToJsonString(String folderName) {
     // 检查表是否存在
-    final tables = _getTablesWithDB();
+    final tables = _getFolderTables();
     if (!tables.contains(folderName)) {
       return '{"error": "Table does not exist"}';
     }
@@ -1154,7 +1228,7 @@ class LocalFavoritesManager {
     var comics = <FavoriteItemWithFolderInfo>[];
     for (var table in folderNames) {
       // 检查表是否存在
-      final tables = _getTablesWithDB();
+      final tables = _getFolderTables();
       if (!tables.contains(table)) {
         continue; // 跳过不存在的表
       }
@@ -1248,7 +1322,7 @@ class LocalFavoritesManager {
   }
 
   int countUpdates(String folder) {
-    final tables = _getTablesWithDB();
+    final tables = _getFolderTables();
     if (!tables.contains(folder)) return 0;
     return _db.select("""
       select count(*) as c from "$folder"

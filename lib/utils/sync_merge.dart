@@ -18,7 +18,17 @@ class SyncMerge {
   static int lastMergedCount = 0;
 
   /// 表名不是收藏文件夹，需要单独处理。
-  static const Set<String> _metaTables = {'folder_sync', 'folder_order'};
+  ///
+  /// - `folder_sync` / `folder_order`：文件夹元数据
+  /// - `deleted_items`：删除墓碑（记录用户删掉了哪些收藏）
+  static const Set<String> _metaTables = {
+    'folder_sync',
+    'folder_order',
+    'deleted_items',
+  };
+
+  /// 删除墓碑表名。
+  static const String _tombstoneTable = 'deleted_items';
 
   /// 收藏表的标准列（旧版本可能缺部分列，这里统一按需补齐）。
   static const List<String> _favoriteColumns = [
@@ -64,7 +74,18 @@ class SyncMerge {
       final backupTables = _tables(backupDb);
       final localTables = _tables(localDb);
 
-      // 1. 文件夹并集：备份里有、本机没有的文件夹 -> 建表
+      // 0. 先把双方的「删除墓碑」合并起来，再读回合并后的完整墓碑表。
+      //
+      // 顺序很关键：必须先有墓碑，后面「补条目」时才知道哪些是**用户已经删掉的**、
+      // 绝不能从备份里补回来。否则就是「删了又回来，怎么都删不掉」。
+      changed += _mergeTombstones(localDb, backupDb);
+      final tombstones = _readTombstones(localDb);
+
+      // 1. 应用墓碑：本机还留着的、已经被删掉的条目 -> 清掉。
+      //    （比如 A 机删了并上传，B 机下载时就要把自己这份也删掉。）
+      changed += _applyTombstones(localDb, tombstones);
+
+      // 2. 文件夹并集：备份里有、本机没有的文件夹 -> 建表
       for (final table in backupTables) {
         if (_metaTables.contains(table)) continue;
         if (!localTables.contains(table)) {
@@ -72,16 +93,16 @@ class SyncMerge {
         }
       }
 
-      // 2. 逐表合并条目
+      // 3. 逐表合并条目（跳过已被墓碑标记删掉的）
       for (final table in backupTables) {
         if (_metaTables.contains(table)) continue;
         if (!_tables(localDb).contains(table)) {
           _createFavoriteTable(localDb, table);
         }
-        changed += _mergeTable(localDb, backupDb, table);
+        changed += _mergeTable(localDb, backupDb, table, tombstones);
       }
 
-      // 3. folder_order 并集（保留已有顺序，缺失的补 0）
+      // 4. folder_order 并集（保留已有顺序，缺失的补 0）
       if (backupTables.contains('folder_order')) {
         _mergeFolderOrder(localDb, backupDb);
       }
@@ -96,7 +117,11 @@ class SyncMerge {
   }
 
   /// 合并单张表，返回新增/更新条数。
-  static int _mergeTable(Database localDb, Database backupDb, String table) {
+  ///
+  /// [tombstones] 是合并后的删除墓碑表；命中墓碑的条目会被**跳过**，
+  /// 否则用户删掉的东西会被备份原样搬回来。
+  static int _mergeTable(Database localDb, Database backupDb, String table,
+      Map<String, String> tombstones) {
     var count = 0;
     final rows = backupDb.select('select * from "$table";');
     // 备份里的列可能比本机少，先对齐列。
@@ -106,6 +131,19 @@ class SyncMerge {
       final target = row['target'] as String?;
       final type = row['type'] as int?;
       if (target == null || type == null) continue;
+
+      final rowTime = row['time'] as String?;
+      final tombstoneTime = tombstones[_tombstoneKey(table, target, type)];
+      if (_tombstoneWins(tombstoneTime, rowTime)) {
+        // 这条被删过，且删除时间不早于它的收藏时间 -> 用户是真心要删，
+        // 不要从备份里补回来。
+        continue;
+      }
+      if (tombstoneTime != null && tombstoneTime.isNotEmpty) {
+        // 条目比墓碑新 -> 用户删掉之后又重新收藏了，撤销这条墓碑，
+        // 免得它一直挂着、下次合并又把条目误删。
+        _deleteTombstone(localDb, table, target, type);
+      }
 
       // 本机已有的同一条目
       final exist = localDb.select(
@@ -123,13 +161,160 @@ class SyncMerge {
       // 两边都有 -> 保留 time 较新的
       // 注意：绝不能因为 time 为空就误判为更旧而丢弃备份数据
       final localTime = exist.first['time'] as String?;
-      final backupTime = row['time'] as String?;
-      if (_isNewer(backupTime, localTime)) {
+      if (_isNewer(rowTime, localTime)) {
         _updateRow(localDb, table, row);
         count++;
       }
     }
     return count;
+  }
+
+  /// 墓碑表的唯一键：文件夹 + target + type。
+  static String _tombstoneKey(String folder, String target, int type) {
+    return "$folder\u0000$target\u0000$type";
+  }
+
+  /// 删除墓碑是否应该压过条目（即：删除是否算数）。
+  ///
+  /// 判据是「谁更晚」：
+  /// - 墓碑比条目新 → 用户先收藏、后删除 → 删除生效，条目不该存在；
+  /// - 条目比墓碑新 → 用户删掉之后又重新收藏了 → 保留条目。
+  ///
+  /// 时间相同时按「删除优先」（同一秒内删除，视为用户最终意图是删）。
+  static bool _tombstoneWins(String? tombstoneTime, String? itemTime) {
+    if (tombstoneTime == null || tombstoneTime.isEmpty) return false;
+    if (itemTime == null || itemTime.isEmpty) return true;
+    return tombstoneTime.compareTo(itemTime) >= 0;
+  }
+
+  /// 把备份里的墓碑并进本机（同一个键取较新的删除时间），返回实际变化数。
+  static int _mergeTombstones(Database localDb, Database backupDb) {
+    if (!_tables(backupDb).contains(_tombstoneTable)) {
+      // 老备份没有墓碑表，直接跳过。
+      return 0;
+    }
+    if (!_tables(localDb).contains(_tombstoneTable)) {
+      _createTombstoneTable(localDb);
+    }
+    var count = 0;
+    try {
+      final rows = backupDb.select('select * from "$_tombstoneTable";');
+      for (final row in rows) {
+        final folder = row['folder'] as String?;
+        final target = row['target'] as String?;
+        final type = row['type'] as int?;
+        if (folder == null || target == null || type == null) continue;
+        final time = row['deleted_time'] as String?;
+
+        final exist = localDb.select(
+          'select * from "$_tombstoneTable" '
+          'where folder == ? and target == ? and type == ?;',
+          [folder, target, type],
+        );
+        if (exist.isEmpty) {
+          localDb.execute(
+            'insert or replace into "$_tombstoneTable" '
+            '(folder, target, type, deleted_time) values (?, ?, ?, ?);',
+            [folder, target, type, time],
+          );
+          count++;
+        } else {
+          final localTime = exist.first['deleted_time'] as String?;
+          if (_isNewer(time, localTime)) {
+            localDb.execute(
+              'update "$_tombstoneTable" set deleted_time = ? '
+              'where folder == ? and target == ? and type == ?;',
+              [time, folder, target, type],
+            );
+            count++;
+          }
+        }
+      }
+    } catch (e, s) {
+      LogManager.addLog(
+          LogLevel.error, "SyncMerge", "mergeTombstones failed: $e\n$s");
+    }
+    return count;
+  }
+
+  /// 删除单条墓碑（条目被重新收藏时撤销）。
+  static void _deleteTombstone(
+      Database db, String folder, String target, int type) {
+    try {
+      db.execute(
+        'delete from "$_tombstoneTable" '
+        'where folder == ? and target == ? and type == ?;',
+        [folder, target, type],
+      );
+    } catch (e) {
+      // 表可能不存在，忽略。
+    }
+  }
+
+  /// 读出本机全部墓碑，返回 `键 -> 删除时间`。
+  static Map<String, String> _readTombstones(Database localDb) {
+    final res = <String, String>{};
+    if (!_tables(localDb).contains(_tombstoneTable)) return res;
+    try {
+      for (final row in localDb.select('select * from "$_tombstoneTable";')) {
+        final folder = row['folder'] as String?;
+        final target = row['target'] as String?;
+        final type = row['type'] as int?;
+        final time = row['deleted_time'] as String?;
+        if (folder == null || target == null || type == null) continue;
+        res[_tombstoneKey(folder, target, type)] = time ?? "";
+      }
+    } catch (e) {
+      // 表结构异常时按「没有墓碑」处理，不影响正常合并。
+    }
+    return res;
+  }
+
+  /// 把墓碑应用到本机：本机还留着的、已经被删掉的条目清掉。返回删除条数。
+  static int _applyTombstones(Database localDb, Map<String, String> tombstones) {
+    if (tombstones.isEmpty) return 0;
+    var count = 0;
+    final localTables = _tables(localDb).toSet();
+    for (final entry in tombstones.entries) {
+      final parts = entry.key.split("\u0000");
+      if (parts.length != 3) continue;
+      final folder = parts[0];
+      final target = parts[1];
+      final type = int.tryParse(parts[2]);
+      if (type == null) continue;
+      if (!localTables.contains(folder)) continue;
+      try {
+        final exist = localDb.select(
+          'select time from "$folder" where target == ? and type == ?;',
+          [target, type],
+        );
+        if (exist.isEmpty) continue;
+        // 删掉之后又重新收藏的，不能删（条目比墓碑新）。
+        if (!_tombstoneWins(entry.value, exist.first['time'] as String?)) {
+          continue;
+        }
+        localDb.execute(
+          'delete from "$folder" where target == ? and type == ?;',
+          [target, type],
+        );
+        count++;
+      } catch (e) {
+        // 单条失败不影响其它条目。
+      }
+    }
+    return count;
+  }
+
+  static void _createTombstoneTable(Database db) {
+    db.execute('''
+      create table if not exists "$_tombstoneTable"(
+        folder text,
+        target text,
+        type int,
+        deleted_time TEXT,
+        primary key (folder, target, type)
+      );
+    ''');
   }
 
   /// a 是否比 b 新。时间格式为 "yyyy-MM-dd HH:mm:ss"，可直接字符串比较。

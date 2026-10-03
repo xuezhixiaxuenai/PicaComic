@@ -610,6 +610,10 @@ Future<bool> importData([String? filePath, bool force = false,
   String data = '';
   try {
     data = await compute<List<String>, String>((data) async {
+      // 隔离区里 LogManager.logFile 是 null，日志会被**全部丢弃**（见 log.dart）。
+      // 主 isolate 把日志路径放在 data[5] 传了进来，这里接上 ——
+      // 否则下面 SyncMerge 的合并过程（以及本回调内的所有日志）都看不见。
+      LogManager.attachIsolateLogFile(data.length > 5 ? data[5] : null);
       var path = data[0];
       await extractPortableZipFile(data[1], "$path/dataTemp");
       _flattenExtractedRoot("$path/dataTemp");
@@ -743,7 +747,9 @@ Future<bool> importData([String? filePath, bool force = false,
       filePath,
       DownloadManager().path!,
       appdata.settings[46],
-      (enableCheck ? "1" : "0")
+      (enableCheck ? "1" : "0"),
+      // 日志文件路径：隔离区拿不到主 isolate 的静态 logFile，靠它接上。
+      LogManager.logFile?.path ?? ""
     ]);
   } catch (e, s) {
     Log.error("importData", "$e\n$s");

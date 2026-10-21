@@ -414,8 +414,31 @@ void _checkAndCreate(Database db) {
       );
     """);
   }
+  // 「删除墓碑」表：记录用户删掉的收藏条目。
+  //
+  // 为什么需要它：多设备同步用的是**并集合并**（SyncMerge.mergeFavoriteDb），
+  // 只增不减 —— 本机删掉一条，服务器/另一台设备上还留着，下次合并就把它
+  // 原样搬回来。表现就是「删了又回来，根本删不掉」。
+  //
+  // 有了这张表，删除就变成了一条**可以同步的记录**：合并时先看墓碑，
+  // 被标记删掉的条目不再从备份里补回来，本机已有的也会被清掉。
+  //
+  // 时间戳用于区分「删掉」和「删掉之后又重新收藏」：只有墓碑比条目的
+  // time 新，删除才算数；否则说明用户后来又把这本加回来了。
+  if (!tables.contains('deleted_items')) {
+    db.execute("""
+      create table deleted_items (
+        folder text,
+        target text,
+        type int,
+        deleted_time TEXT,
+        primary key (folder, target, type)
+      );
+    """);
+  }
   tables.remove('folder_sync');
   tables.remove('folder_order');
+  tables.remove('deleted_items');
   if (tables.isEmpty) return;
   var testTable = tables.first;
   var res = db.select("""
@@ -456,7 +479,8 @@ void _checkAndCreate(Database db) {
 Map<String, dynamic> _readLocalFavoritesSnapshot(Database db) {
   final folders = _getTablesWithDB(db)
     ..remove('folder_sync')
-    ..remove('folder_order');
+    ..remove('folder_order')
+    ..remove('deleted_items');
   final savedFolderOrder = <String, int>{
     for (final row in db.select("SELECT * FROM folder_order"))
       row['folder_name'] as String: row['order_value'] as int? ?? 0,
@@ -521,6 +545,10 @@ class LocalFavoritesManager {
 
   String get _dbPath => "${App.dataPath}/local_favorite.db";
 
+  /// 删除墓碑里表示「整个文件夹被删掉」的 type 值。
+  /// 正常收藏的 type 都是 >= 0，用 -1 区分不会撞车。
+  static const int _folderTombstoneType = -1;
+
   Map<String, List<Map<String, dynamic>>> _comics = {};
   List<String> _folderNames = [];
   Map<String, int> _folderOrder = {};
@@ -532,6 +560,12 @@ class LocalFavoritesManager {
   Timer? _debounceTimer;
 
   Future<void> init() async {
+    await _reloadFromDb();
+    await readData();
+  }
+
+  /// 从数据库重新加载内存状态（只读，不导入外部数据、不触发上传）。
+  Future<void> _reloadFromDb() async {
     final snapshot = await DatabaseGateway.instance
         .isolateOp<Map<String, dynamic>>(_dbPath, (db) {
       _checkAndCreate(db);
@@ -547,7 +581,30 @@ class LocalFavoritesManager {
         (snapshot['folderSync'] as List)
             .map((e) => Map<String, dynamic>.from(e as Map)));
     _modifiedAfterLastCache = true;
-    await readData();
+  }
+
+  bool _closed = false;
+
+  /// 合并收藏前调用：等挂起的写入落盘，避免与 SyncMerge 直接写 db 文件冲突。
+  ///
+  /// 5.1.x 的数据库操作都走 DatabaseGateway 的短连接（用完即关），
+  /// 所以这里不需要 dispose，只要确保没有未完成的异步写。
+  Future<void> closeForMerge() async {
+    if (_closed) return;
+    _debounceTimer?.cancel();
+    try {
+      await _lastWrite;
+    } catch (_) {
+      // 上一次写入失败不应阻塞合并
+    }
+    _closed = true;
+  }
+
+  /// 合并完成后调用：数据库文件已被 SyncMerge 重写，重新加载内存状态。
+  Future<void> reopenAfterMerge() async {
+    if (!_closed) return;
+    _closed = false;
+    await _reloadFromDb();
   }
 
   void _runBackground(Future<void> operation, {bool upload = false}) {
@@ -606,7 +663,15 @@ class LocalFavoritesManager {
   ///
   /// This function will delete current database, then create a new one, finally
   /// import data.
-  Future<void> readData() async {
+  Future<void> readData({bool merge = false}) async {
+    // 合并模式：数据库已经由 SyncMerge 直接改写完毕（本机收藏与备份做了并集），
+    // 这里只需把内存状态重新读一遍。
+    //
+    // 注意不能再走下面的临时库导入流程 —— 那会 clearAll() 把刚合并好的数据清空。
+    if (merge) {
+      await _reloadFromDb();
+      return;
+    }
     var file = File("${App.dataPath}/localFavorite");
     if (file.existsSync()) {
       Map<String, List<FavoriteItem>> allComics = {};
@@ -648,7 +713,8 @@ class LocalFavoritesManager {
         final hasFolderOrder = tables.contains('folder_order');
         final folders = List<String>.from(tables)
           ..remove('folder_sync')
-          ..remove('folder_order');
+          ..remove('folder_order')
+          ..remove('deleted_items');
         final tableFolders = List<String>.from(folders);
         final folderToOrder = <String, int>{};
         for (final folder in folders) {
@@ -900,6 +966,12 @@ class LocalFavoritesManager {
     _sortFolderNames();
     _runBackground(
       DatabaseGateway.instance.isolateOp(_dbPath, (db) {
+        // 重新创建同名文件夹 -> 撤掉文件夹级墓碑，
+        // 否则下次合并会把它当成"用户删掉的"再删一次。
+        db.execute("""
+          delete from deleted_items
+          where folder == ? and target == '' and type == ?;
+        """, [name, _folderTombstoneType]);
         db.execute("""
           create table "$name"(
             target text,
@@ -989,6 +1061,14 @@ class LocalFavoritesManager {
           insert into "$folder" (target, name, author, type, tags, cover_path, time, display_order)
           values (?, ?, ?, ?, ?, ?, ?, ?);
         """, values);
+        // 重新收藏 -> 撤掉这条的删除墓碑，
+        // 否则下次合并又会把它当成"已删除"再删一遍。
+        for (final key in comic.type._compatibleKeys) {
+          db.execute("""
+            delete from deleted_items
+            where folder == ? and target == ? and type == ?;
+          """, [folder, comic.target, key]);
+        }
       }),
       upload: true,
     );
@@ -1046,17 +1126,35 @@ class LocalFavoritesManager {
   /// delete a folder
   void deleteFolder(String name) {
     _modifiedAfterLastCache = true;
+    // 先把要删的条目收集出来 —— 只 drop 表不留墓碑的话，并集合并会把
+    // 整个文件夹连同里面的收藏一起从备份搬回来（「删了自动恢复」）。
+    final rows = List<Map<String, dynamic>>.from(_comics[name] ?? const []);
+    final now = getCurTime();
     _comics.remove(name);
     _folderNames.remove(name);
     _folderSync.removeWhere((row) => row['folder_name'] == name);
     _runBackground(DatabaseGateway.instance.isolateOp(_dbPath, (db) {
+      for (final row in rows) {
+        final target = row['target'] as String?;
+        final type = row['type'] as int?;
+        if (target == null || type == null) continue;
+        db.execute("""
+          insert or replace into deleted_items (folder, target, type, deleted_time)
+          values (?, ?, ?, ?);
+        """, [name, target, type, now]);
+      }
+      // 文件夹级墓碑：合并时不要把这个文件夹重建回来（否则会冒出个空文件夹）。
+      db.execute("""
+        insert or replace into deleted_items (folder, target, type, deleted_time)
+        values (?, '', ?, ?);
+      """, [name, _folderTombstoneType, now]);
       db.execute("""
         delete from folder_sync where folder_name == ?;
       """, [name]);
       db.execute("""
         drop table "$name";
       """);
-    }));
+    }), upload: true);
   }
 
   void checkAndDeleteCover(FavoriteItem item) async {
@@ -1078,12 +1176,25 @@ class LocalFavoritesManager {
     final keys = type._compatibleKeys;
     rows.removeWhere(
         (row) => row['target'] == target && keys.contains(row['type']));
+    final now = getCurTime();
     _runBackground(
       DatabaseGateway.instance.isolateOp(_dbPath, (db) {
         db.execute("""
           delete from "$folder"
           where target == ? and type in (${List.filled(keys.length, '?').join(',')});
         """, [target, ...keys]);
+        // 记删除墓碑：同步是并集合并（只增不减），不留记录的话
+        // 下次合并会把这条原样搬回来 —— 表现就是「删了又回来」。
+        //
+        // 必须按 _compatibleKeys 逐个写：同一个收藏可能以「旧版 int key」或
+        // 「脚本 hashCode」的形式存在，墓碑键是 (folder, target, type) 精确匹配，
+        // 只写 type.key 会漏掉其它表示形式。
+        for (final key in keys) {
+          db.execute("""
+            insert or replace into deleted_items (folder, target, type, deleted_time)
+            values (?, ?, ?, ?);
+          """, [folder, target, key, now]);
+        }
       }),
       upload: true,
     );

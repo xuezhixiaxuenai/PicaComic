@@ -674,7 +674,10 @@ class ImageManager {
         return;
       }
       caching = await CacheManager().openWrite(cacheKey);
-      final savePath = caching.file.path;
+      // 非空别名：下面会在重试循环里重新赋值，若直接用可空的 caching，
+      // Dart 的可空提升会失效（编译报 "cannot be called on CachingFile?"）。
+      CachingFile file = caching!;
+      final savePath = file.file.path;
 
       // 失败换节点重试。
       //
@@ -711,8 +714,9 @@ class ImageManager {
           }
           config = Map<String, dynamic>.from(next);
           // 丢掉这次写了一半的文件，重新开一个
-          await caching.close();
-          caching = await CacheManager().openWrite(cacheKey);
+          await file.close();
+          file = await CacheManager().openWrite(cacheKey);
+          caching = file;
           LogManager.addLog(LogLevel.info, "ImageManager",
               "retry image ($attempt/3): ${config['url'] ?? url}");
         }
@@ -729,7 +733,7 @@ class ImageManager {
 
       await for (var data in res.data!.stream) {
         if (!shouldModifyData) {
-          await caching.writeBytes(data);
+          await file.writeBytes(data);
         }
         imageData.add(data);
         var progress = DownloadProgress(
@@ -764,12 +768,12 @@ class ImageManager {
           data = await modifyImageWithScript(data, script as String);
         }
         result = data;
-        await caching.writeBytes(data);
+        await file.writeBytes(data);
       }
 
       var ext = script != null ? 'png' : getExt(res);
       CacheManager().setType(cacheKey, ext);
-      await caching.close();
+      await file.close();
       var length = result?.length ?? imageData.length;
       yield DownloadProgress(
         length,

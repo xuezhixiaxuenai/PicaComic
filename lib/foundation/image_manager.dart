@@ -669,9 +669,25 @@ class ImageManager {
       loadingItems[cacheKey] = DownloadProgress(0, 1, cacheKey, "");
       var cache = await CacheManager().findCache(cacheKey);
       if (cache != null) {
-        yield DownloadProgress(
-            1, 1, cacheKey, cache, null, CacheManager().getType(cacheKey));
-        return;
+        // 0 字节的缓存是之前下载失败留下的残骸（空响应/中途断开）。
+        // 如果当成命中直接返回，图片 provider 会读到空数据抛
+        // "Empty image data"，而且**每次都会命中这个空文件**，
+        // 于是这张图就永久打不开了。这里删掉它当没命中。
+        var cacheLen = 0;
+        try {
+          final cf = File(cache);
+          if (cf.existsSync()) {
+            cacheLen = await cf.length();
+          }
+        } catch (_) {}
+        if (cacheLen > 0) {
+          yield DownloadProgress(
+              1, 1, cacheKey, cache, null, CacheManager().getType(cacheKey));
+          return;
+        }
+        try {
+          await CacheManager().delete(cacheKey);
+        } catch (_) {}
       }
       caching = await CacheManager().openWrite(cacheKey);
       // 非空别名：下面会在重试循环里重新赋值，若直接用可空的 caching，
@@ -698,6 +714,11 @@ class ImageManager {
                   method: config['method'] ?? 'GET',
                   headers: config['headers'] ?? {'user-agent': webUA},
                   responseType: ResponseType.stream));
+          // 空的 200 也要当成失败：H@H 节点对失效的 keystamp 有时就回一个
+          // 空 body，直接往下走会把空文件写进缓存，UI 弹 "Empty image data"。
+          if (res.data!.contentLength == 0) {
+            throw Exception('empty response body');
+          }
           break;
         } catch (e) {
           final onLoadFailed = config['onLoadFailed'];
@@ -763,6 +784,13 @@ class ImageManager {
         );
         yield progress;
         loadingItems[cacheKey] = progress;
+      }
+
+      // 收完是空的说明这个节点给了个空响应（Content-Length 缺失时前面的
+      // 检查拦不住）。直接抛出去，外层 catch 会 cancel 掉半成品，
+      // 不会把 0 字节写进缓存（否则这张图以后永远打不开）。
+      if (imageData.length == 0) {
+        throw Exception('empty image data');
       }
 
       Uint8List? result;

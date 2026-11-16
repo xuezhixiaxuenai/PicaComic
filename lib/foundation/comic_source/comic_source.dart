@@ -280,11 +280,23 @@ class ComicSource {
   }
 
   Future<bool> reLogin() async {
-    if (data["account"] == null) {
+    // 必须同时校验 account 与 login 本身，不能只看存档里的 data["account"]。
+    //
+    // 反例（真实踩过）：源更新后不再声明 account 配置，但本地 `$key.data` 里
+    // 仍然留着旧的登录数据 → `data["account"] != null` 成立，可 `account` 是
+    // 空的，下面 `account!` 直接抛
+    // "Null check operator used on a null value"。
+    //
+    // 这个异常发生在「收藏夹加载 → 登录过期 → 重登录」这条路上
+    // （parser.dart 的 retryZone），一旦炸掉整个收藏状态查询都会失败，
+    // 用户看到的就是一串看不懂的报错，且换域名、更新 API 都没用 ——
+    // 因为问题不在网络，在这里的解包。
+    final AccountConfig? acc = account;
+    if (data["account"] == null || acc == null || acc.login == null) {
       return false;
     }
     final List accountData = data["account"];
-    var res = await account!.login!(accountData[0], accountData[1]);
+    final res = await acc.login!(accountData[0], accountData[1]);
     if (res.error) {
       Log.error("Failed to re-login", res.errorMessage ?? "Error");
     }

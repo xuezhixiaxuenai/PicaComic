@@ -80,7 +80,17 @@ class JsEngine with _JSEngineApi {
     }
     try {
       _dio ??= logDio(BaseOptions(
-          responseType: ResponseType.plain, validateStatus: (status) => true));
+          responseType: ResponseType.plain,
+          validateStatus: (status) => true,
+          // 必须设超时。原来这里是 null，意味着**永久等待**。
+          //
+          // 实证：e-hentai 的图片分发到第三方 H@H 节点（xxx.hath.network:1521），
+          // 节点头挂了/限速时连接会挂住不返回，而 JS 源的图片也走这条 dio，
+          // 于是阅读器里那几张图永远停在「加载中」。
+          // 日志：H@H 请求 5 次，只有 2 次有响应，另外 3 次没有任何 Response。
+          connectTimeout: const Duration(seconds: 12),
+          sendTimeout: const Duration(seconds: 20),
+          receiveTimeout: const Duration(seconds: 30)));
       final cookieJar = SingleInstanceCookieJar.instance;
       if (cookieJar != null) {
         _cookieJar ??= cookieJar;

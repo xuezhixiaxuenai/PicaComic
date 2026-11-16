@@ -55,7 +55,15 @@ class ImageManager {
 
   ImageManager._create();
 
-  final dio = logDio(BaseOptions())
+  // 图片专用 dio。必须设超时：
+  // e-hentai 的图分发到第三方 H@H 节点（*.hath.network:1521），节点不可用时
+  // 连接会挂住不返回；没有超时的话阅读器就一直转圈（用户实测：有进度条很慢，
+  // 加载到最后又不动了）。receiveTimeout 是**两次收到数据之间**的间隔，
+  // 所以慢但在传的图不会被误杀，只有真正卡死的才会中断。
+  final dio = logDio(BaseOptions(
+      connectTimeout: const Duration(seconds: 12),
+      sendTimeout: const Duration(seconds: 20),
+      receiveTimeout: const Duration(seconds: 30)))
     ..interceptors.addAll([
       CookieManagerSql(SingleInstanceCookieJar.instance!),
       CloudflareInterceptor(),

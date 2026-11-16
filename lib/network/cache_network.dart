@@ -29,6 +29,12 @@ class CachedNetwork {
       }
     }
     options.responseType = ResponseType.bytes;
+    // 兜底超时：调用方普遍只传 BaseOptions()，不带任何超时。
+    // e-hentai 的图片分发到第三方 H@H 节点，节点不可用时连接会挂住不返回，
+    // 没有超时就会无限转圈（阅读器里表现为「一直转圈 / 加载到最后不动」）。
+    options.connectTimeout ??= const Duration(seconds: 12);
+    options.sendTimeout ??= const Duration(seconds: 20);
+    options.receiveTimeout ??= const Duration(seconds: 30);
     var dio = log ? logDio(options, http2) : Dio(options);
     if (cookieJar != null) {
       dio.interceptors.add(CookieManagerSql(cookieJar));

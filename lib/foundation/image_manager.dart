@@ -650,7 +650,7 @@ class ImageManager {
       String url, String comicId, String epId, String sourceKey) async* {
     final source = ComicSource.find(sourceKey) ??
         (throw "Unknown Comic Source $sourceKey");
-    final config = source.getImageLoadingConfig == null
+    var config = source.getImageLoadingConfig == null
         ? <String, dynamic>{}
         : await source.getImageLoadingConfig!(url, comicId, epId);
     final script = config['modifyImage'];
@@ -676,12 +676,47 @@ class ImageManager {
       caching = await CacheManager().openWrite(cacheKey);
       final savePath = caching.file.path;
 
-      var res = await dio.request<ResponseBody>(config['url'] ?? url,
-          data: config['data'],
-          options: Options(
-              method: config['method'] ?? 'GET',
-              headers: config['headers'] ?? {'user-agent': webUA},
-              responseType: ResponseType.stream));
+      // 失败换节点重试。
+      //
+      // e-hentai 的图片分发到第三方 H@H 节点（*.hath.network），每次向源
+      // 请求地址可能分到不同节点；分到慢节点（实测 500 B/s）或坏节点就会
+      // 卡住不动。源为此提供了 onLoadFailed 回调（内部带 nl 参数重新请求
+      // api，通常能换到另一个节点），但 App 原来**直接把它丢掉了**，
+      // 于是只能干等着 —— 浏览器自己实现了这个重试，所以网页版正常。
+      //
+      // 实测：连续三次请求同一页，第三次返回了不同的节点路径。
+      late Response<ResponseBody> res;
+      var attempt = 0;
+      while (true) {
+        try {
+          res = await dio.request<ResponseBody>(config['url'] ?? url,
+              data: config['data'],
+              options: Options(
+                  method: config['method'] ?? 'GET',
+                  headers: config['headers'] ?? {'user-agent': webUA},
+                  responseType: ResponseType.stream));
+          break;
+        } catch (e) {
+          final onLoadFailed = config['onLoadFailed'];
+          if (attempt >= 3 || onLoadFailed is! JSInvokable) {
+            rethrow;
+          }
+          attempt++;
+          dynamic next = onLoadFailed([]);
+          if (next is Future) {
+            next = await next;
+          }
+          if (next is! Map) {
+            rethrow;
+          }
+          config = Map<String, dynamic>.from(next);
+          // 丢掉这次写了一半的文件，重新开一个
+          await caching.close();
+          caching = await CacheManager().openWrite(cacheKey);
+          LogManager.addLog(LogLevel.info, "ImageManager",
+              "retry image ($attempt/3): ${config['url'] ?? url}");
+        }
+      }
 
       final imageData = BytesBuilder();
 

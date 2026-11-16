@@ -639,7 +639,24 @@ async function fetch(url, options) {
         headers: result.headers,
         arrayBuffer: async () => result.body,
         text: async () => Convert.decodeUtf8(result.body),
-        json: async () => JSON.parse(Convert.decodeUtf8(result.body)),
+        json: async () => {
+            // 不能直接 JSON.parse：站点返回网页（下架页、登录页、风控页）时
+            // 会抛出 "SyntaxError: unexpected token: '<' at <input>:1:1"，
+            // 这串东西对用户毫无意义，看起来就像「随机报错」。
+            const text = Convert.decodeUtf8(result.body);
+            try {
+                return JSON.parse(text);
+            } catch (e) {
+                const head = (text || '').trimStart().slice(0, 60).replace(/\s+/g, ' ');
+                const lower = head.toLowerCase();
+                let hint = '服务器返回的是网页而不是数据';
+                if (lower.startsWith('<!doctype') || lower.startsWith('<html')) {
+                    hint = '该内容可能已下架、需要登录或被站点拦截';
+                }
+                throw new Error(
+                    `${hint}（HTTP ${result.status}）。响应开头：${head || '(空)'}`);
+            }
+        },
     }
 }
 

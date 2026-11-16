@@ -712,7 +712,24 @@ class ImageManager {
           if (next is! Map) {
             rethrow;
           }
-          config = Map<String, dynamic>.from(next);
+          var newConfig = Map<String, dynamic>.from(next);
+          // onLoadFailed 内部带着固定的 nl，服务端往往返回**同一个节点**
+          // （实测两次重试的 url 完全一致，于是白等）。这种情况下直接重新
+          // 向源要一次分配——不带 nl 的请求有概率分到别的节点。
+          if ((newConfig['url'] ?? url) == (config['url'] ?? url)) {
+            final loader = source.getImageLoadingConfig;
+            if (loader != null) {
+              try {
+                final fresh = await loader(url, comicId, epId);
+                if ((fresh['url'] ?? url) != (config['url'] ?? url)) {
+                  newConfig = Map<String, dynamic>.from(fresh);
+                }
+              } catch (_) {
+                // 重新分配失败就沿用原来的结果
+              }
+            }
+          }
+          config = newConfig;
           // 丢掉这次写了一半的文件，重新开一个
           await file.close();
           file = await CacheManager().openWrite(cacheKey);

@@ -183,18 +183,48 @@ class ComicSourceParser {
       builtInSource.data = source.data;
     }
 
-    Future.delayed(const Duration(milliseconds: 50), () {
-      // Initialize apiDomains for JM source if not defined (Venera compatibility)
-      JsEngine().runCode("""
-        (function() {
-          var temp = ComicSource.sources.$_key;
-          if (temp && typeof temp.constructor !== 'undefined' && 
-              typeof temp.constructor.apiDomains === 'undefined' &&
-              typeof temp.constructor.fallbackServers !== 'undefined') {
-            temp.constructor.apiDomains = temp.constructor.fallbackServers;
+    // 给「自带备用域名列表」的源（目前是 jm.js）注入 API 域名。
+    //
+    // 原来的写法只在 apiDomains 未定义时塞 fallbackServers，问题有两个：
+    //  1) 那份备用列表早就失效了（cdntwice.org / cdnsha.org 现在都 301
+    //     跳到网页站），拿回来是 HTML，当 JSON 解析就报
+    //     `unexpected token '<' at <input>:1:1`；
+    //  2) 它和用户在「更新API域名」里配置的列表（settings[85]）**完全脱钩** ——
+    //     用户怎么更新都没用，源始终用那批死域名。
+    //     日志实证：GET https://www.cdntwice.org/album?id=… → 301 → HTML。
+    //
+    // 另外注入被 Future.delayed(50ms) 推后，导入备份后立刻触发 loadInfo
+    // 会撞进空窗，报
+    //   TypeError: cannot read property of undefined at get baseUrl
+    // （jm.js: `https://${JM.apiDomains[index]}`，此时 apiDomains 还是 undefined）
+    //
+    // 所以：优先用用户配置的列表，配置为空才退回备用列表；并且立刻注入一次。
+    final configuredDomains = appdata.appSettings.jmApiDomains
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty)
+        .toList();
+    final injectScript = """
+      (function() {
+        var temp = ComicSource.sources.$_key;
+        if (!temp || typeof temp.constructor === 'undefined') { return; }
+        var C = temp.constructor;
+        if (typeof C.fallbackServers === 'undefined' &&
+            typeof C.apiDomains === 'undefined') { return; }
+        var configured = ${jsonEncode(configuredDomains)};
+        if (configured && configured.length > 0) {
+          C.apiDomains = configured;
+        } else if (typeof C.apiDomains === 'undefined' || !C.apiDomains ||
+                   C.apiDomains.length === 0) {
+          if (typeof C.fallbackServers !== 'undefined') {
+            C.apiDomains = C.fallbackServers;
           }
-        })()
-      """);
+        }
+      })()
+    """;
+    JsEngine().runCode(injectScript);
+
+    Future.delayed(const Duration(milliseconds: 50), () {
+      JsEngine().runCode(injectScript);
       JsEngine().runCode("ComicSource.sources.$_key.init()");
     });
 

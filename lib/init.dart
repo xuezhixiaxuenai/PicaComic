@@ -65,8 +65,28 @@ Future<void> init() async {
     if (App.isIOS) {
       logFile = null;
     }
-    if (logFile?.existsSync() ?? false) {
-      await logFile?.delete();
+    // 保留上一次会话的日志，不要把旧文件直接删掉。
+    //
+    // 日志只在启动时重建，原来这里一句 delete() 就把「出问题那一刻」的
+    // 记录一起抹掉了：用户重启一次 App，之前发生了什么就再也查不到，
+    // 排查时只能靠复现 —— 而这类问题往往又复现不出来。
+    //
+    // 改成把旧文件改名成 log.prev.txt（只保留一份），
+    // 于是「本次会话 + 上一次会话」都能看到。
+    if (logFile != null && logFile.existsSync()) {
+      try {
+        final prev = io.File(
+            "${logFile.parent.path}${io.Platform.pathSeparator}log.prev.txt");
+        if (prev.existsSync()) {
+          await prev.delete();
+        }
+        await logFile.rename(prev.path);
+      } catch (_) {
+        // 重命名失败（权限/跨设备等）时退回原行为，不能因此起不来
+        try {
+          await logFile.delete();
+        } catch (_) {}
+      }
     }
     LogManager.logFile = logFile;
     LogManager.addLog(LogLevel.info, "App Status", "Start initialization.");

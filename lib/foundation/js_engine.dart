@@ -324,6 +324,18 @@ class JsEngine with _JSEngineApi {
       error = e.toString();
     }
 
+    // 把 JS 侧的每次请求记进日志。
+    //
+    // 原来这条通道（init.js 的 fetch → message method:'http' → 这里）
+    // **完全不记录请求地址**，于是排查「点开漫画报 unexpected token '<'」时，
+    // 日志里只有一行 `Response .../error/album_missing`，却没有对应的请求 URL，
+    // 根本判断不出是哪个接口/哪本漫画被重定向到了错误页。
+    LogManager.addLog(
+        LogLevel.info,
+        "JS HTTP",
+        "${req['http_method'] ?? 'GET'} ${req['url']} -> "
+        "${response?.statusCode ?? 'ERR'}${error != null ? ' | $error' : ''}");
+
     Map<String, String> headers = {};
 
     response?.headers

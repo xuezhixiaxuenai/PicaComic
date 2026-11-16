@@ -22,6 +22,10 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
+          # 钉死版本：最新的 stable 要求 Gradle >= 9.3.1，
+          # 而项目用的是 Gradle 8.14.3 + AGP 8.12，升级会连带改一堆构建配置。
+          # 3.47.7 是上次成功编译验证过的版本。
+          flutter-version: '3.47.7'
           channel: 'stable'
           cache: true
 

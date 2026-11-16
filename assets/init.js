@@ -654,7 +654,7 @@ async function fetch(url, options) {
                     hint = '该内容可能已下架、需要登录或被站点拦截';
                 }
                 throw new Error(
-                    `${hint}（HTTP ${result.status}）。响应开头：${head || '(空)'}`);
+                    `${hint}（HTTP ${result.status}）URL: ${url}。响应开头：${head || '(空)'}`);
             }
         },
     }
